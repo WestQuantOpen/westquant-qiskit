@@ -1,0 +1,33 @@
+{
+  "plugin": {
+    "id": "westquant.qiskit",
+    "version": "0.1.0a2",
+    "api_version": "0.1"
+  },
+  "framework": {
+    "name": "qiskit",
+    "supported_versions": ">=2.5,<3"
+  },
+  "capabilities": {
+    "import": ["circuit"],
+    "transformations": [
+      "layout",
+      "routing",
+      "translation",
+      "optimization",
+      "deterministic_pipeline_search"
+    ],
+    "evaluators": [
+      "depth",
+      "size",
+      "two_qubit_gates",
+      "swap_gates",
+      "compile_success",
+      "exact_unitary_equivalence"
+    ],
+    "baseline": "qiskit_default_opt2_seed0",
+    "repgraph_export": true,
+    "training_jsonl": true,
+    "wqt_policy": false
+  }
+}
