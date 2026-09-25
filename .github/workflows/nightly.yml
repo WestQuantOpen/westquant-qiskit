@@ -1,0 +1,35 @@
+name: Nightly SDK Breakage Detection
+
+on:
+  schedule:
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+
+jobs:
+  nightly:
+    name: Test against latest SDK versions
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Checkout WestQuant Core
+        uses: actions/checkout@v4
+        with:
+          repository: WestQuantOpen/westquant-core
+          path: _westquant-core
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Install latest SDKs
+        run: |
+          pip install --upgrade pip
+          pip install -e ./_westquant-core[test]
+          pip install --upgrade qiskit pytket pennylane pulser 2>/dev/null || true
+          pip install -e .[test] 2>/dev/null || pip install -e .
+      - name: Run tests
+        run: |
+          pytest tests/ -v || echo "Nightly tests failed — SDK breakage detected"
+      - name: Report status
+        if: always()
+        run: |
+          echo "Nightly run completed. Check for SDK breakage above."
