@@ -67,6 +67,99 @@ def numeric_metrics(metrics: dict[str, Any]) -> dict[str, float | int | None]:
     return {key: metrics.get(key) for key in keys}
 
 
+def noise_aware_metrics(
+    circuit: Any,
+    backend: Any = None,
+    target: Any = None,
+) -> dict[str, Any]:
+    """Compute noise/fidelity-aware metrics for a circuit.
+
+    Returns a dict with ``estimated_fidelity``, ``total_duration`` and
+    ``noise_aware_depth``.  When ``backend``/``target`` is ``None`` or does not
+    expose per-gate error/duration data, the corresponding fields are ``None``.
+    """
+    result: dict[str, Any] = {
+        "estimated_fidelity": None,
+        "total_duration": None,
+        "noise_aware_depth": None,
+    }
+
+    # Collect gate names in execution order.
+    ops: list[str] = []
+    for instruction in getattr(circuit, "data", []):
+        op = getattr(instruction, "operation", instruction)
+        ops.append(str(getattr(op, "name", type(op).__name__)).lower())
+
+    if not ops:
+        return result
+
+    # Try to obtain a properties/props source from backend or target.
+    props = None
+    if backend is not None:
+        props = getattr(backend, "properties", None)
+        if callable(props):
+            try:
+                props = props()
+            except Exception:
+                props = None
+    if props is None and target is not None:
+        props = getattr(target, "props", None)
+
+    if props is None:
+        return result
+
+    # Build per-gate error rate and duration lookup tables.
+    def _gate_error(props: Any, name: str, qubits: tuple) -> float | None:
+        getter = getattr(props, "gate_error", None)
+        if callable(getter):
+            try:
+                return float(getter(name, qubits))
+            except Exception:
+                return None
+        return None
+
+    def _gate_length(props: Any, name: str, qubits: tuple) -> float | None:
+        for attr in ("gate_length", "gate_duration"):
+            getter = getattr(props, attr, None)
+            if callable(getter):
+                try:
+                    return float(getter(name, qubits))
+                except Exception:
+                    continue
+        return None
+
+    fidelity = 1.0
+    total_duration = 0.0
+    weighted_depth = 0.0
+    have_fidelity = False
+    have_duration = False
+
+    for instruction in getattr(circuit, "data", []):
+        op = getattr(instruction, "operation", instruction)
+        name = str(getattr(op, "name", type(op).__name__)).lower()
+        qubits = tuple(
+            int(getattr(circuit.find_bit(q), "index", 0))
+            for q in getattr(instruction, "qubits", ())
+        )
+        err = _gate_error(props, name, qubits)
+        length = _gate_length(props, name, qubits)
+        if err is not None:
+            fidelity *= (1.0 - err)
+            have_fidelity = True
+        if length is not None:
+            total_duration += length
+            have_duration = True
+            # Weight this gate's contribution to depth by its error rate.
+            weighted_depth += (1.0 - (err if err is not None else 0.0)) * length
+
+    if have_fidelity:
+        result["estimated_fidelity"] = fidelity
+    if have_duration:
+        result["total_duration"] = total_duration
+        result["noise_aware_depth"] = weighted_depth
+    return result
+
+
 class QiskitAdapter:
     framework = "qiskit"
 

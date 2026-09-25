@@ -21,6 +21,7 @@ class PipelineConfig:
     translation_method: str = "translator"
     seed_transpiler: int = 0
     approximation_degree: float = 1.0
+    basis_gates: tuple[str, ...] | None = None
 
     def __post_init__(self) -> None:
         if self.optimization_level not in (0, 1, 2, 3):
@@ -33,7 +34,8 @@ class PipelineConfig:
         text = (
             f"opt={self.optimization_level}|layout={self.layout_method}|"
             f"routing={self.routing_method}|translation={self.translation_method}|"
-            f"seed={self.seed_transpiler}|approx={self.approximation_degree:.9g}"
+            f"seed={self.seed_transpiler}|approx={self.approximation_degree:.9g}|"
+            f"basis={self.basis_gates}"
         )
         return "qiskit:" + sha256(text.encode("utf-8")).hexdigest()[:16]
 
@@ -45,6 +47,7 @@ class PipelineConfig:
             "translation_method": self.translation_method,
             "seed_transpiler": self.seed_transpiler,
             "approximation_degree": self.approximation_degree,
+            "basis_gates": list(self.basis_gates) if self.basis_gates else None,
         }
 
 
@@ -58,6 +61,7 @@ class SearchSpace:
     translation_methods: tuple[str, ...] = ("translator", "synthesis")
     seeds: tuple[int, ...] = (0,)
     approximation_degrees: tuple[float, ...] = (1.0,)
+    basis_gates_options: tuple[tuple[str, ...], ...] = ()
 
     def __post_init__(self) -> None:
         if not all((self.optimization_levels, self.layout_methods, self.routing_methods,
@@ -65,7 +69,7 @@ class SearchSpace:
             raise ValueError("all search-space dimensions must be non-empty")
 
     def __len__(self) -> int:
-        return (
+        base = (
             len(self.optimization_levels)
             * len(self.layout_methods)
             * len(self.routing_methods)
@@ -73,6 +77,8 @@ class SearchSpace:
             * len(self.seeds)
             * len(self.approximation_degrees)
         )
+        n_basis = len(self.basis_gates_options) if self.basis_gates_options else 1
+        return base * n_basis
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -82,6 +88,7 @@ class SearchSpace:
             "translation_methods": list(self.translation_methods),
             "seeds": list(self.seeds),
             "approximation_degrees": list(self.approximation_degrees),
+            "basis_gates_options": [list(b) for b in self.basis_gates_options] if self.basis_gates_options else [],
         }
 
     @property
@@ -91,6 +98,7 @@ class SearchSpace:
         return "qiskit-space:" + sha256(blob.encode("utf-8")).hexdigest()[:16]
 
     def iter_configs(self) -> Iterator[PipelineConfig]:
+        basis_iter = self.basis_gates_options if self.basis_gates_options else (None,)
         for values in product(
             self.optimization_levels,
             self.layout_methods,
@@ -98,6 +106,7 @@ class SearchSpace:
             self.translation_methods,
             self.seeds,
             self.approximation_degrees,
+            basis_iter,
         ):
             yield PipelineConfig(
                 optimization_level=values[0],
@@ -106,6 +115,7 @@ class SearchSpace:
                 translation_method=values[3],
                 seed_transpiler=values[4],
                 approximation_degree=values[5],
+                basis_gates=values[6],
             )
 
     @classmethod

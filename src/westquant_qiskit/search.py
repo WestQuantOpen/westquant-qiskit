@@ -50,6 +50,7 @@ class CandidateResult:
     representation_id: str | None = None
     pareto: bool = False
     rank: int | None = None
+    compiled_circuit: Any | None = None
 
     @property
     def invalid(self) -> bool:
@@ -200,6 +201,31 @@ class SearchResult:
             "best_delta_vs_default_baseline": improvement,
         }
 
+    def get_circuit(self) -> Any | None:
+        """Return the compiled circuit for the best candidate, or None."""
+        best = self.best
+        if best is None:
+            return None
+        # Try stored circuit first
+        for c in self.candidates:
+            if c.candidate_id == best.candidate_id and hasattr(c, 'compiled_circuit') and c.compiled_circuit is not None:
+                return c.compiled_circuit
+        return None
+
+    def to_qasm(self) -> str | None:
+        """Export the best candidate's circuit as QASM, or None."""
+        circuit = self.get_circuit()
+        if circuit is None:
+            return None
+        try:
+            return circuit.qasm()
+        except Exception:
+            try:
+                from qiskit.qasm3 import dumps
+                return dumps(circuit)
+            except Exception:
+                return None
+
 
 def _dominates(a: CandidateResult, b: CandidateResult) -> bool:
     av, bv = a.objective_tuple(), b.objective_tuple()
@@ -270,6 +296,21 @@ class DeterministicSearchEngine:
         self.adapter = adapter or QiskitAdapter()
         self.baseline_config = baseline_config
 
+    @staticmethod
+    def _is_config_compatible(config: PipelineConfig, basis_gates: list[str] | None) -> bool:
+        """Return False for known-incompatible translation/basis combinations.
+
+        Qiskit's ``synthesis`` translation method does not support the legacy
+        ``u3``/``u`` basis gates and raises a ``TranspilerError``.  Detecting
+        this up-front lets us record the failure deterministically instead of
+        relying on the exception path.
+        """
+        if config.translation_method == "synthesis" and basis_gates:
+            lowered = {str(g).lower() for g in basis_gates}
+            if "u3" in lowered or "u" in lowered:
+                return False
+        return True
+
     def _compile_one(
         self,
         circuit: Any,
@@ -316,6 +357,7 @@ class DeterministicSearchEngine:
                 metrics=metrics,
                 compile_seconds=elapsed,
                 verification=verification,
+                compiled_circuit=compiled,
             )
         except Exception as exc:
             elapsed = time.perf_counter() - started
@@ -468,6 +510,28 @@ class DeterministicSearchEngine:
 
         results: list[CandidateResult] = []
         for config in configs:
+            # A config may carry its own basis-gate set from the search space;
+            # that takes precedence over the search-level ``basis_gates``.
+            effective_basis = list(config.basis_gates) if config.basis_gates else basis_gates
+            if not self._is_config_compatible(config, effective_basis):
+                result = CandidateResult(
+                    candidate_id=config.candidate_id,
+                    config=config,
+                    compile_success=False,
+                    role="search_candidate",
+                    error="Incompatible config: synthesis + u3 basis",
+                )
+                self._add_attempt_to_graph(
+                    graph,
+                    challenge_id=challenge_id,
+                    root_id=root_id,
+                    circuit=None,
+                    result=result,
+                    adapter=self.adapter,
+                    input_metrics=input_metrics,
+                )
+                results.append(result)
+                continue
             compiled, result = self._compile_one(
                 circuit,
                 config,
@@ -476,7 +540,7 @@ class DeterministicSearchEngine:
                 backend=backend,
                 target=target,
                 coupling_map=coupling_map,
-                basis_gates=basis_gates,
+                basis_gates=effective_basis,
                 dt=dt,
             )
             self._add_attempt_to_graph(
