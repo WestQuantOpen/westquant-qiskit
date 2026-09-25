@@ -1,0 +1,12 @@
+[console_scripts]
+westquant-qiskit-1000 = westquant_qiskit.batch1000:main
+westquant-qiskit-search = westquant_qiskit.cli:main
+
+[qiskit.transpiler.layout]
+westquant = westquant_qiskit.stage:WestQuantLayoutPlugin
+
+[qiskit.transpiler.optimization]
+westquant = westquant_qiskit.stage:WestQuantOptimizationPlugin
+
+[qiskit.transpiler.routing]
+westquant = westquant_qiskit.stage:WestQuantRoutingPlugin

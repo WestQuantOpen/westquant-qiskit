@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "westquant-qiskit"
+version = "0.1.0a3"
+description = "Deterministic representation search, RepGraph tracing, and WQT-ready data generation for Qiskit"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "Apache-2.0"}
+authors = [{name = "WestQuant Open / David Vesterlund"}]
+dependencies = [
+  "westquant-core>=0.2.0a1",
+  "qiskit>=2.5,<3",
+]
+
+[project.urls]
+Homepage = "https://github.com/WestQuantOpen"
+Source = "https://github.com/WestQuantOpen/westquant-qiskit"
+
+[project.entry-points."qiskit.transpiler.layout"]
+westquant = "westquant_qiskit.stage:WestQuantLayoutPlugin"
+[project.entry-points."qiskit.transpiler.routing"]
+westquant = "westquant_qiskit.stage:WestQuantRoutingPlugin"
+[project.entry-points."qiskit.transpiler.optimization"]
+westquant = "westquant_qiskit.stage:WestQuantOptimizationPlugin"
+
+[project.scripts]
+westquant-qiskit-search = "westquant_qiskit.cli:main"
+westquant-qiskit-1000 = "westquant_qiskit.batch1000:main"
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src", "../westquant-core/src"]

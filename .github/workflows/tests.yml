@@ -1,0 +1,35 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install core and plugin
+        run: |
+          python -m pip install --upgrade pip
+          pip install "qiskit~=2.5.2" pytest
+          # In the split-repo release, westquant-core will come from PyPI.
+          # For the Wave 1 monorepo scaffold, install the sibling package.
+          if [ -d ../westquant-core ]; then
+            pip install -e ../westquant-core
+          else
+            pip install "westquant-core>=0.2.0a1"
+          fi
+          pip install -e .
+      - name: Unit tests
+        run: pytest -q
+      - name: Real Qiskit smoke search
+        run: |
+          westquant-qiskit-search --suite smoke --max-candidates 4 --output /tmp/wq-smoke
+          test -f /tmp/wq-smoke/manifest.json
