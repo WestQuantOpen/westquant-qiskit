@@ -1,5 +1,0 @@
-westquant-core>=0.2.0a1
-qiskit<3,>=2.5
-
-[test]
-pytest>=8

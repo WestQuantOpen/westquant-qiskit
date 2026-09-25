@@ -5,31 +5,112 @@ on:
   pull_request:
 
 jobs:
-  test:
+  unit:
     runs-on: ubuntu-latest
     strategy:
       matrix:
         python-version: ["3.10", "3.11", "3.12"]
     steps:
       - uses: actions/checkout@v4
+      - name: Checkout WestQuant Core
+        uses: actions/checkout@v4
+        with:
+          repository: WestQuantOpen/westquant-core
+          path: _westquant-core
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - name: Install core and plugin
+      - name: Install
         run: |
           python -m pip install --upgrade pip
-          pip install "qiskit~=2.5.2" pytest
-          # In the split-repo release, westquant-core will come from PyPI.
-          # For the Wave 1 monorepo scaffold, install the sibling package.
-          if [ -d ../westquant-core ]; then
-            pip install -e ../westquant-core
-          else
-            pip install "westquant-core>=0.2.0a1"
-          fi
-          pip install -e .
+          pip install -e ./_westquant-core[test]
+          pip install "qiskit~=2.5.2"
+          pip install -e .[test]
       - name: Unit tests
         run: pytest -q
-      - name: Real Qiskit smoke search
+      - name: Plugin discovery
         run: |
-          westquant-qiskit-search --suite smoke --max-candidates 4 --output /tmp/wq-smoke
-          test -f /tmp/wq-smoke/manifest.json
+          python - <<'PY'
+          from qiskit.transpiler.preset_passmanagers.plugin import list_stage_plugins
+          for stage in ("layout", "routing", "optimization"):
+              plugins = list_stage_plugins(stage)
+              print(stage, plugins)
+              assert "westquant" in plugins, f"westquant not found in {stage}"
+          print("Plugin discovery: OK")
+          PY
+
+  integration:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Checkout WestQuant Core
+        uses: actions/checkout@v4
+        with:
+          repository: WestQuantOpen/westquant-core
+          path: _westquant-core
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ./_westquant-core[test]
+          pip install "qiskit~=2.5.2"
+          pip install -e .[test]
+      - name: Grid smoke search
+        run: |
+          westquant-qiskit-search --suite smoke --search grid --max-candidates 8 --output /tmp/wq-grid
+          test -f /tmp/wq-grid/ghz4-line/summary.json
+          test -f /tmp/wq-grid/ghz4-line/repgraph.json
+          test -f /tmp/wq-grid/ghz4-line/training.jsonl
+      - name: Sequential smoke search
+        run: |
+          westquant-qiskit-search --suite smoke --search sequential --beam-width 2 --output /tmp/wq-seq
+          test -f /tmp/wq-seq/ghz4-line/summary.json
+          test -f /tmp/wq-seq/ghz4-line/repgraph.json
+          test -f /tmp/wq-seq/ghz4-line/trajectory.jsonl
+      - name: RepGraph validation
+        run: |
+          python - <<'PY'
+          import json, glob
+          for f in sorted(glob.glob("/tmp/wq-seq/*/repgraph.json")):
+              with open(f) as fh:
+                  g = json.load(fh)
+              node_ids = {n["id"] for n in g["nodes"]}
+              dangling = [e for e in g["edges"] if e["input_id"] not in node_ids or e["output_id"] not in node_ids]
+              assert not dangling, f"Dangling edges in {f}"
+          print("RepGraph validation: OK")
+          PY
+      - name: Deterministic rerun
+        run: |
+          westquant-qiskit-search --suite smoke --search sequential --beam-width 2 --output /tmp/wq-seq-2
+          python - <<'PY'
+          import json
+          for ch in ["ghz4-line", "qft4-line", "random4d4-ring"]:
+              with open(f"/tmp/wq-seq/{ch}/summary.json") as a, open(f"/tmp/wq-seq-2/{ch}/summary.json") as b:
+                  sa, sb = json.load(a), json.load(b)
+              assert sa["best_state_id"] == sb["best_state_id"], f"{ch}: non-deterministic"
+              assert sa["best_metrics"] == sb["best_metrics"], f"{ch}: non-deterministic metrics"
+          print("Determinism: OK")
+          PY
+
+  build:
+    runs-on: ubuntu-latest
+    needs: [unit, integration]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build wheel and sdist
+        run: |
+          python -m pip install --upgrade pip build twine
+          python -m build
+          python -m twine check dist/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
