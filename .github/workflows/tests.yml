@@ -1,6 +1,7 @@
 name: Tests
 
 on:
+  workflow_call:
   push:
     branches: [main]
   pull_request:
@@ -12,6 +13,7 @@ jobs:
     strategy:
       matrix:
         python-version: ["3.10", "3.11", "3.12"]
+        qiskit-version: ["2.5.2", "2.6.1"]
     steps:
       - uses: actions/checkout@v4
       - name: Set up Python
@@ -20,8 +22,8 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - name: Install
         run: |
-          pip install westquant-core>=0.2.0a1
-          pip install "qiskit~=2.5.2"
+          pip install "westquant-core>=0.2.0a1"
+          pip install "qiskit==${{ matrix.qiskit-version }}"
           pip install -e .[test]
       - name: Test
         run: pytest tests/ -v

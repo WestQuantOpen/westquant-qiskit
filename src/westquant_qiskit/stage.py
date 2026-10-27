@@ -1,9 +1,10 @@
 """WestQuant Qiskit transpiler stage plugins.
 
-These plugins execute real WestQuant representation search within the
-Qiskit transpiler pipeline. When a user selects 'westquant' as a stage
-name, the plugin evaluates multiple Qiskit compilation configurations
-and selects the best one using WestQuant's Pareto-front evaluation.
+These plugins execute a deterministic best-of search within the Qiskit
+transpiler pipeline. When a user selects 'westquant' as a stage name, the
+plugin evaluates several built-in Qiskit strategies for that stage and keeps
+the candidate with the lowest two-qubit cost (SWAP counted as three 2Q gates),
+breaking ties by depth.
 
 Usage:
     from qiskit.transpiler.preset_passmanagers import generate_preset_pass_manager
@@ -12,27 +13,46 @@ Usage:
         backend=backend,
         layout_method="westquant",
         routing_method="westquant",
+        optimization_method="westquant",
+        seed_transpiler=7,
     )
     tqc = pm.run(qc)
+    pm.property_set["westquant_selection"]  # per-stage candidate records
 
-The WestQuant search evaluates alternative layout/routing/optimization
-strategies, measures resource metrics (2Q gates, depth, swaps), and
-selects the Pareto-optimal candidate. Failed candidates are retained
-for training data.
+Stage semantics:
+    layout        Scores trivial/dense/sabre initial layouts by their fully
+                  transpiled cost, sets ``property_set["layout"]`` to the best
+                  one and then applies Qiskit's standard embedding.
+    routing       Runs SabreSwap, BasicSwap and LookaheadSwap on the physical
+                  DAG and keeps the cheapest routed DAG and its final layout,
+                  wrapped in Qiskit's standard routing stage.
+    optimization  Runs Qiskit's default optimization stage for levels 0-3 and
+                  keeps the cheapest result.
 
-Recursion guard: the baseline is always 'default', never 'westquant',
-so there is no risk of infinite recursion.
+Every candidate result is recorded. Failed candidates are logged as warnings
+and recorded with their error; if every candidate fails, a TranspilerError is
+raised instead of silently returning the input. Candidates are always built
+from Qiskit's built-in methods, never 'westquant', so there is no recursion.
+Results are deterministic for a fixed ``seed_transpiler`` (default seed 0).
 """
 from __future__ import annotations
 
+import copy
+import logging
+
+from qiskit.converters import circuit_to_dag, dag_to_circuit
+from qiskit.dagcircuit import DAGCircuit
+from qiskit.passmanager import ConditionalController
+from qiskit.transpiler import Layout, PassManager, TranspilerError
+from qiskit.transpiler.basepasses import TransformationPass
+from qiskit.transpiler.passes import BasicSwap, LookaheadSwap, SabreSwap, SetLayout
+from qiskit.transpiler.preset_passmanagers import common
 from qiskit.transpiler.preset_passmanagers.plugin import (
     PassManagerStagePlugin,
     PassManagerStagePluginManager,
 )
-from qiskit.transpiler import PassManager
-from qiskit.transpiler.basepasses import TransformationPass
-from qiskit.dagcircuit import DAGCircuit
 
+logger = logging.getLogger(__name__)
 
 # Layout methods to try during WestQuant search
 LAYOUT_CANDIDATES = ["trivial", "dense", "sabre"]
@@ -45,175 +65,153 @@ OPT_LEVELS = [0, 1, 2, 3]
 
 
 def _count_2q_gates(dag: DAGCircuit) -> int:
-    """Count two-qubit gates in a DAG."""
-    count = 0
-    for node in dag.op_nodes():
-        if len(node.qargs) == 2:
-            count += 1
-    return count
+    """Two-qubit cost of a DAG; a SWAP counts as three 2Q gates."""
+    return sum(3 if node.name == "swap" else 1 for node in dag.op_nodes() if len(node.qargs) == 2)
 
 
 def _dag_depth(dag: DAGCircuit) -> int:
-    """Estimate circuit depth from DAG."""
-    try:
-        return dag.depth()
-    except Exception:
-        return 0
+    return dag.depth()
+
+
+def _coupling(config):
+    target = getattr(config, "target", None)
+    return getattr(config, "coupling_map", None) or (target.build_coupling_map() if target is not None else None)
 
 
 class WestQuantSearchPass(TransformationPass):
-    """Custom transpiler pass that runs WestQuant representation search.
-
-    This pass evaluates multiple compilation configurations and selects
-    the Pareto-optimal result based on 2Q gate count and depth.
-    """
+    """Evaluate the candidates of one transpiler stage and apply the best one."""
 
     def __init__(self, stage: str = "optimization", config=None, optimization_level: int | None = None) -> None:
         super().__init__()
+        if stage not in ("layout", "routing", "optimization"):
+            raise TranspilerError(f"Unknown WestQuant stage: {stage!r}")
         self.stage = stage
         self.config = config
-        self.optimization_level = optimization_level or 2
-
-    def run(self, dag: DAGCircuit) -> DAGCircuit:
-        """Run WestQuant search on the DAG.
-
-        For v0.1, this pass evaluates multiple Qiskit configurations
-        and selects the best one. The search is deterministic.
-        """
-        # Get the current circuit from the DAG
-        from qiskit import QuantumCircuit
-        qc = QuantumCircuit.from_instructions(dag)
-
-        # Get coupling map and basis gates from config
-        coupling_map = None
-        basis_gates = None
-        if self.config:
-            coupling_map = getattr(self.config, "coupling_map", None)
-            basis_gates = getattr(self.config, "basis_gates", None)
-
-        # Baseline metrics (current DAG)
-        baseline_2q = _count_2q_gates(dag)
-        baseline_depth = _dag_depth(dag)
-
-        best_dag = dag
-        best_2q = baseline_2q
-        best_depth = baseline_depth
-
-        # Try alternative configurations based on stage
-        candidates = self._get_candidates()
-
-        for candidate in candidates:
-            try:
-                candidate_dag = self._try_candidate(qc, candidate, coupling_map, basis_gates)
-                if candidate_dag is None:
-                    continue
-
-                candidate_2q = _count_2q_gates(candidate_dag)
-                candidate_depth = _dag_depth(candidate_dag)
-
-                # Pareto comparison: prefer fewer 2Q gates, then less depth
-                if candidate_2q < best_2q or (candidate_2q == best_2q and candidate_depth < best_depth):
-                    best_dag = candidate_dag
-                    best_2q = candidate_2q
-                    best_depth = candidate_depth
-
-            except Exception:
-                # Failed candidates are silently skipped in the pass
-                # (they are retained in the full search engine, not here)
-                continue
-
-        return best_dag
+        self.optimization_level = 2 if optimization_level is None else optimization_level
+        seed = getattr(config, "seed_transpiler", None)
+        self.seed = 0 if seed is None or seed < 0 else seed
 
     def _get_candidates(self) -> list:
-        """Get candidate configurations for this stage."""
-        if self.stage == "layout":
-            return LAYOUT_CANDIDATES
-        elif self.stage == "routing":
-            return ROUTING_CANDIDATES
-        elif self.stage == "optimization":
-            return OPT_LEVELS
-        return []
+        return {"layout": LAYOUT_CANDIDATES, "routing": ROUTING_CANDIDATES, "optimization": OPT_LEVELS}[self.stage]
 
-    def _try_candidate(self, qc, candidate, coupling_map, basis_gates) -> DAGCircuit | None:
-        """Try a candidate configuration and return the resulting DAG."""
+    def run(self, dag: DAGCircuit) -> DAGCircuit:
+        records, best = [], None
+        for candidate in self._get_candidates():
+            try:
+                result = self._try_candidate(dag, candidate)
+            except Exception as exc:  # recorded and logged, never silently dropped
+                logger.warning("WestQuant %s candidate %r failed: %s", self.stage, candidate, exc)
+                records.append({"candidate": candidate, "ok": False, "error": f"{type(exc).__name__}: {exc}"})
+                continue
+            cost_dag, applied = result
+            record = {"candidate": candidate, "ok": True, "two_qubit": _count_2q_gates(cost_dag), "depth": _dag_depth(cost_dag)}
+            records.append(record)
+            if best is None or (record["two_qubit"], record["depth"]) < (best[0]["two_qubit"], best[0]["depth"]):
+                best = (record, applied)
+        if best is None:
+            raise TranspilerError(f"All WestQuant {self.stage} candidates failed: {records}")
+        record, applied = best
+        selection = dict(self.property_set["westquant_selection"] or {})
+        selection[self.stage] = {"selected": record["candidate"], "candidates": records}
+        self.property_set["westquant_selection"] = selection
+        return self._apply(dag, applied)
+
+    def _try_candidate(self, dag: DAGCircuit, candidate):
+        """Return (DAG used for scoring, payload needed to apply the candidate)."""
+        if self.stage == "layout":
+            return self._layout_candidate(dag, candidate)
+        if self.stage == "routing":
+            return self._routing_candidate(dag, candidate)
+        return self._optimization_candidate(dag, candidate)
+
+    def _layout_candidate(self, dag, method):
         from qiskit.transpiler.preset_passmanagers import generate_preset_pass_manager
 
-        kwargs = {"optimization_level": self.optimization_level}
-        if coupling_map:
-            kwargs["coupling_map"] = coupling_map
-        if basis_gates:
-            kwargs["basis_gates"] = basis_gates
+        cfg = self.config
+        routing = cfg.routing_method if cfg.routing_method not in (None, "westquant") else "sabre"
+        pm = generate_preset_pass_manager(
+            optimization_level=self.optimization_level,
+            target=cfg.target,
+            coupling_map=None if cfg.target is not None else cfg.coupling_map,
+            basis_gates=None if cfg.target is not None else cfg.basis_gates,
+            layout_method=method,
+            routing_method=routing,
+            seed_transpiler=self.seed,
+        )
+        tqc = pm.run(dag_to_circuit(dag))
+        physical = tqc.layout.initial_index_layout(filter_ancillas=True)
+        return circuit_to_dag(tqc), Layout({dag.qubits[i]: p for i, p in enumerate(physical)})
 
+    def _routing_candidate(self, dag, method):
+        coupling = _coupling(self.config)
+        if coupling is None:
+            raise TranspilerError("Routing requires a coupling map or target.")
+        routing_pass = {
+            "sabre": lambda: SabreSwap(coupling, heuristic="decay", seed=self.seed),
+            "basic": lambda: BasicSwap(coupling),
+            "lookahead": lambda: LookaheadSwap(coupling),
+        }[method]()
+        routed = routing_pass.run(copy.deepcopy(dag))
+        return routed, (routed, routing_pass.property_set["final_layout"])
+
+    def _optimization_candidate(self, dag, level):
+        pm = PassManagerStagePluginManager().get_passmanager_stage("optimization", "default", self.config, optimization_level=level)
+        out = circuit_to_dag(pm.run(dag_to_circuit(dag))) if pm is not None else copy.deepcopy(dag)
+        return out, out
+
+    def _apply(self, dag, applied):
         if self.stage == "layout":
-            kwargs["layout_method"] = candidate
-        elif self.stage == "routing":
-            kwargs["routing_method"] = candidate
-        elif self.stage == "optimization":
-            kwargs["optimization_level"] = candidate
-
-        try:
-            pm = generate_preset_pass_manager(**kwargs)
-            tqc = pm.run(qc)
-            return tqc._layout.dag if hasattr(tqc, "_layout") and hasattr(tqc._layout, "dag") else None
-        except Exception:
-            return None
+            self.property_set["layout"] = applied
+            return dag
+        if self.stage == "routing":
+            routed, final_layout = applied
+            if final_layout is not None:
+                current = self.property_set["final_layout"]
+                self.property_set["final_layout"] = final_layout if current is None else current.compose(final_layout, dag.qubits)
+            return routed
+        return applied
 
 
 class WestQuantLayoutPlugin(PassManagerStagePlugin):
-    """WestQuant layout plugin — evaluates multiple layout methods.
-
-    Instead of always using Qiskit's default (sabre), this plugin
-    evaluates trivial, dense, and sabre layouts and selects the
-    Pareto-optimal one based on 2Q gate count and depth.
-    """
-
-    stage = "layout"
+    """WestQuant layout plugin: best of trivial, dense and sabre layouts."""
 
     def pass_manager(self, pass_manager_config, optimization_level=None):
-        # Build a PassManager that includes the WestQuant search pass
-        pm = PassManager()
-        pm.append(WestQuantSearchPass(
-            stage="layout",
-            config=pass_manager_config,
-            optimization_level=optimization_level,
+        pm = PassManager([SetLayout(pass_manager_config.initial_layout)])
+        coupling = pass_manager_config.target or pass_manager_config.coupling_map
+        if coupling is None:
+            return pm
+        pm.append(ConditionalController(
+            WestQuantSearchPass(stage="layout", config=pass_manager_config, optimization_level=optimization_level),
+            condition=lambda property_set: not property_set["layout"],
         ))
+        pm.append(common.generate_embed_passmanager(coupling).to_flow_controller())
         return pm
 
 
 class WestQuantRoutingPlugin(PassManagerStagePlugin):
-    """WestQuant routing plugin — evaluates multiple routing methods.
-
-    Instead of always using Qiskit's default (sabre), this plugin
-    evaluates sabre, basic, and lookahead routing and selects the
-    Pareto-optimal one.
-    """
-
-    stage = "routing"
+    """WestQuant routing plugin: best of SabreSwap, BasicSwap and LookaheadSwap."""
 
     def pass_manager(self, pass_manager_config, optimization_level=None):
-        pm = PassManager()
-        pm.append(WestQuantSearchPass(
-            stage="routing",
-            config=pass_manager_config,
-            optimization_level=optimization_level,
-        ))
-        return pm
+        level = 2 if optimization_level is None else optimization_level
+        vf2_call_limit, vf2_max_trials = common.get_vf2_limits(
+            level, pass_manager_config.layout_method, pass_manager_config.initial_layout
+        )
+        return common.generate_routing_passmanager(
+            WestQuantSearchPass(stage="routing", config=pass_manager_config, optimization_level=level),
+            pass_manager_config.target,
+            coupling_map=pass_manager_config.coupling_map,
+            vf2_call_limit=None if level == 0 else vf2_call_limit,
+            vf2_max_trials=None if level == 0 else vf2_max_trials,
+            seed_transpiler=-1,
+            check_trivial=level == 1,
+            use_barrier_before_measurement=True,
+        )
 
 
 class WestQuantOptimizationPlugin(PassManagerStagePlugin):
-    """WestQuant optimization plugin — evaluates multiple optimization levels.
-
-    Instead of always using the specified optimization level, this plugin
-    evaluates levels 0-3 and selects the Pareto-optimal one.
-    """
-
-    stage = "optimization"
+    """WestQuant optimization plugin: best of Qiskit optimization levels 0-3."""
 
     def pass_manager(self, pass_manager_config, optimization_level=None):
-        pm = PassManager()
-        pm.append(WestQuantSearchPass(
-            stage="optimization",
-            config=pass_manager_config,
-            optimization_level=optimization_level,
-        ))
-        return pm
+        return PassManager([
+            WestQuantSearchPass(stage="optimization", config=pass_manager_config, optimization_level=optimization_level)
+        ])

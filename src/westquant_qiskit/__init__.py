@@ -5,7 +5,7 @@ from .search import CandidateResult, DeterministicSearchEngine, SearchResult
 from .verification import QiskitEquivalenceVerifier, VerificationReport
 from .sequential import SequentialSearchEngine, SequentialSearchResult, SequentialSearchSpace
 
-__version__ = "0.1.0a4"
+__version__ = "0.1.2"
 
 __all__ = [
     "QiskitAdapter",
