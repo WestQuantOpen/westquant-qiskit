@@ -75,11 +75,30 @@ the full Pareto front and all losing candidates remain in the dataset.
 
 ## Qiskit integration
 
-The package also exposes alpha stage entry points for Qiskit's native
-transpiler-plugin mechanism.  The plugin stages still delegate to Qiskit
-baselines in this Wave 1 build.  The deterministic search engine is the first
-real WestQuant search implementation and will be wired into stage plugins after
-benchmarking and recursion guards are complete.
+The package registers `westquant` as a Qiskit transpiler stage plugin for the
+`layout`, `routing` and `optimization` stages:
+
+```python
+from qiskit.transpiler.preset_passmanagers import generate_preset_pass_manager
+
+pm = generate_preset_pass_manager(
+    optimization_level=2, backend=backend, seed_transpiler=7,
+    layout_method="westquant", routing_method="westquant", optimization_method="westquant",
+)
+tqc = pm.run(qc)
+print(pm.property_set["westquant_selection"])
+```
+
+Each stage is a deterministic best-of selection among Qiskit's own built-in
+strategies (layout: trivial/dense/sabre; routing: SabreSwap/BasicSwap/
+LookaheadSwap; optimization: levels 0-3), scored by two-qubit cost (SWAP = 3)
+and then depth. Every candidate, including failures and their error messages,
+is recorded in `property_set["westquant_selection"]`; if every candidate fails a
+`TranspilerError` is raised. The routing stage only runs when the circuit is
+not already mapped to the device. Tests check unitary equivalence, ideal output
+distributions with measurements, coupling-map compliance and that the selected
+candidate is the one returned. This is a best-of wrapper over Qiskit, not the
+full sequential policy search described below.
 
 ## Sequential policy search
 
